@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: random-single-link-root-ui-aifilter-kw
+    name: random-single-link-root-ui-aifilter-kw-v3
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
@@ -8,18 +8,20 @@ services:
     autoDeploy: true
     envVars:
       - key: MAX_IMAGES
-        value: 300
+        value: 400
       - key: TIMEOUT
-        value: 10
+        value: 12
       - key: HEAD_CHECK_MAX
         value: 12
       - key: MIN_WIDTH
-        value: 320
+        value: 300
       - key: MIN_HEIGHT
-        value: 320
+        value: 300
       - key: MIN_BYTES
-        value: 15000
+        value: 12000
       - key: REQUIRE_PERSON
         value: 1
+      - key: GET_TRY_LIMIT
+        value: 40
       - key: EXCLUDE_KEYWORDS
         value: "logo, icon, sprite, favicon, avatar, badge, banner, placeholder, ads, advert, tracking, pixel, og:image"
