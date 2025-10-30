@@ -3,7 +3,7 @@ import os, re, json, secrets, string, random, mimetypes
 from urllib.parse import urlparse, urljoin
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, request, jsonify, redirect, abort, make_response, send_file
+from flask import Flask, request, jsonify, redirect, abort, make_response, send_file, Response
 
 app = Flask(__name__)
 
@@ -27,7 +27,6 @@ def no_cache(resp):
     return resp
 
 def domain_allowed(url: str) -> bool:
-    # no domain limits when ALLOW_ANY_DOMAIN is True
     return True if ALLOW_ANY_DOMAIN else False
 
 def normalize_abs(page_url: str, candidate: str) -> str | None:
@@ -63,18 +62,15 @@ def scrape_images(page_url: str) -> list[str]:
         if absu:
             found_abs.append(absu)
 
-    # Collect from <img> and common lazy attrs
     for img in soup.find_all("img"):
         for attr in ("src", "data-src", "data-original", "data-lazy", "data-image"):
             add_img(img.get(attr))
         srcset = img.get("srcset")
         if srcset:
-            # take all candidates from srcset (more robust)
             parts = [p.strip().split(" ")[0] for p in srcset.split(",") if p.strip()]
             for p in parts:
                 add_img(p)
 
-    # <source srcset> in picture
     for src in soup.find_all("source"):
         srcset = src.get("srcset")
         if srcset:
@@ -82,7 +78,6 @@ def scrape_images(page_url: str) -> list[str]:
             for p in parts:
                 add_img(p)
 
-    # Deduplicate, then filter
     seen = set()
     uniq = []
     for u in found_abs:
@@ -90,10 +85,8 @@ def scrape_images(page_url: str) -> list[str]:
             uniq.append(u)
             seen.add(u)
 
-    # First keep URLs with explicit image extensions
     exts = [u for u in uniq if is_ext_image_url(u)]
 
-    # For some sites images have no extension; probe a limited number via HEAD
     if len(exts) < MAX_IMAGES and HEAD_CHECK_MAX > 0:
         candidates = [u for u in uniq if not is_ext_image_url(u)]
         head_ok = []
@@ -102,16 +95,12 @@ def scrape_images(page_url: str) -> list[str]:
                 head_ok.append(u)
         exts.extend(head_ok)
 
-    # Trim to MAX_IMAGES
     return exts[:MAX_IMAGES]
 
 # ----------- Routes -----------
 @app.get("/")
 def home():
-    return ("Page → Random Images service\n"
-            "UI: /ui\n"
-            "One-shot JSON: /rand.json?url=<page_url>\n"
-            "One-shot redirect: /rand?url=<page_url>\n")
+    return redirect("/ui", code=302)
 
 @app.get("/config")
 def config_info():
@@ -120,6 +109,7 @@ def config_info():
         "max_images": MAX_IMAGES,
         "timeout": TIMEOUT,
         "head_check_max": HEAD_CHECK_MAX,
+        "base_dir": BASE_DIR
     })
 
 @app.get("/rand.json")
@@ -137,11 +127,11 @@ def rand_json():
         abort(502, description=f"Failed to fetch page: {e}")
     if not images:
         abort(404, description="No images found on that page")
-    choice = random.choice(images)
+    url = random.choice(images)
     base = request.url_root.rstrip("/")
     return no_cache(jsonify({
         "source_url": page_url,
-        "random_image_url": choice,
+        "random_image_url": url,
         "shareable_random_link": f"{base}/rand?url={page_url}"
     }))
 
@@ -163,13 +153,118 @@ def one_shot_redirect():
     url = random.choice(images)
     return no_cache(redirect(url, code=302))
 
-# ---------- UI ----------
+# ---------- UI (with fallback) ----------
+INLINE_UI = r"""<!doctype html>
+<html>
+<head>
+  <meta charset='utf-8' />
+  <meta name='viewport' content='width=device-width, initial-scale=1' />
+  <title>One-shot Random Image</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin: 16px 0; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    input[type='url'] { flex: 1 1 520px; padding: 10px; border-radius: 8px; border: 1px solid #ccc; }
+    button { padding: 10px 14px; border-radius: 8px; border: 1px solid #aaa; cursor: pointer; }
+    .muted { color: #666; font-size: 0.9rem; }
+    .kvs { display: grid; grid-template-columns: 170px 1fr; gap: 8px; }
+    .preview { margin-top: 12px; }
+    img { max-width: min(100%, 800px); border-radius: 10px; border: 1px solid #ddd; }
+    code { background: #f5f5f5; padding: 2px 6px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <h2>One-shot Random Image</h2>
+  <div class='card'>
+    <div class='row'>
+      <input id='pageUrl' type='url' placeholder='Dán link trang chứa ảnh (https://...)' />
+      <button id='runBtn'>Chạy & hiển thị link</button>
+      <button id='openBtn'>Mở ảnh random</button>
+    </div>
+    <div class='muted' id='cfg'></div>
+  </div>
+
+  <div class='card' id='result' style='display:none;'>
+    <h3>Kết quả</h3>
+    <div class='kvs'>
+      <div>Shareable random link:</div>
+      <div>
+        <a id='shareLink' target='_blank' rel='noopener'></a>
+        <button id='copyShare'>Copy</button>
+      </div>
+      <div>Random image URL:</div>
+      <div>
+        <a id='imgUrl' target='_blank' rel='noopener'></a>
+        <button id='copyImg'>Copy</button>
+      </div>
+    </div>
+    <div class='preview'>
+      <h4>Preview</h4>
+      <img id='preview' alt='Random preview' />
+    </div>
+  </div>
+
+<script>
+async function fetchConfig() {
+  try {
+    const r = await fetch('/config');
+    if (!r.ok) throw new Error('config failed');
+    const cfg = await r.json();
+    document.getElementById('cfg').textContent =
+      `Allow any domain: ${cfg.allow_any_domain ? 'ON' : 'OFF'} | MAX_IMAGES=${cfg.max_images} | HEAD_CHECK_MAX=${cfg.head_check_max}`;
+  } catch (e) {
+    document.getElementById('cfg').textContent = 'Không đọc được cấu hình server.';
+  }
+}
+
+async function runOnce() {
+  const url = document.getElementById('pageUrl').value.trim();
+  if (!url) { alert('Dán link trang vào trước đã.'); return; }
+  const r = await fetch('/rand.json?url=' + encodeURIComponent(url));
+  if (!r.ok) { const t = await r.text(); throw new Error(t || ('HTTP ' + r.status)); }
+  const data = await r.json();
+  document.getElementById('result').style.display = 'block';
+  document.getElementById('shareLink').href = data.shareable_random_link;
+  document.getElementById('shareLink').textContent = data.shareable_random_link;
+  document.getElementById('imgUrl').href = data.random_image_url;
+  document.getElementById('imgUrl').textContent = data.random_image_url;
+  document.getElementById('preview').src = data.random_image_url;
+}
+
+document.getElementById('runBtn').addEventListener('click', async () => {
+  const btn = document.getElementById('runBtn');
+  btn.disabled = true; btn.textContent = 'Đang lấy ảnh...';
+  try { await runOnce(); } catch (e) { alert('Lỗi: ' + e.message); }
+  finally { btn.disabled = false; btn.textContent = 'Chạy & hiển thị link'; }
+});
+
+document.getElementById('openBtn').addEventListener('click', () => {
+  const url = document.getElementById('pageUrl').value.trim();
+  if (!url) { alert('Dán link trang vào trước đã.'); return; }
+  window.open('/rand?url=' + encodeURIComponent(url), '_blank');
+});
+
+document.getElementById('copyShare').addEventListener('click', () => {
+  const t = document.getElementById('shareLink').href;
+  navigator.clipboard.writeText(t).catch(()=>{});
+});
+document.getElementById('copyImg').addEventListener('click', () => {
+  const t = document.getElementById('imgUrl').href;
+  navigator.clipboard.writeText(t).catch(()=>{});
+});
+
+fetchConfig();
+</script>
+</body>
+</html>"""
+
 @app.get("/ui")
 def ui_page():
     html_path = os.path.join(BASE_DIR, "static", "ui", "index.html")
     if os.path.isfile(html_path):
         return send_file(html_path)
-    return abort(404, description="UI file missing")
+    # Fallback inline UI if the file is missing
+    return Response(INLINE_UI, mimetype="text/html")
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
