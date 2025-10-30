@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: random-single-link-root-ui-aifilter-kw-v3
+    name: random-single-link-filters-toggle-v4
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
@@ -11,8 +11,6 @@ services:
         value: 400
       - key: TIMEOUT
         value: 12
-      - key: HEAD_CHECK_MAX
-        value: 12
       - key: MIN_WIDTH
         value: 300
       - key: MIN_HEIGHT
@@ -22,6 +20,6 @@ services:
       - key: REQUIRE_PERSON
         value: 1
       - key: GET_TRY_LIMIT
-        value: 40
+        value: 50
       - key: EXCLUDE_KEYWORDS
         value: "logo, icon, sprite, favicon, avatar, badge, banner, placeholder, ads, advert, tracking, pixel, og:image"
