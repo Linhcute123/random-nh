@@ -1,17 +1,25 @@
 services:
   - type: web
-    name: random-single-link-root-ui
+    name: random-single-link-root-ui-aifilter-kw
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn app:app --preload --workers=1 --threads=4 --timeout=90
+    startCommand: gunicorn app:app --preload --workers=1 --threads=2 --timeout=120
     autoDeploy: true
     envVars:
-      - key: ALLOW_ANY_DOMAIN
-        value: 1
       - key: MAX_IMAGES
         value: 300
       - key: TIMEOUT
         value: 10
       - key: HEAD_CHECK_MAX
         value: 12
+      - key: MIN_WIDTH
+        value: 320
+      - key: MIN_HEIGHT
+        value: 320
+      - key: MIN_BYTES
+        value: 15000
+      - key: REQUIRE_PERSON
+        value: 1
+      - key: EXCLUDE_KEYWORDS
+        value: "logo, icon, sprite, favicon, avatar, badge, banner, placeholder, ads, advert, tracking, pixel, og:image"

@@ -1,19 +1,38 @@
 \
-import os, re, json, random, mimetypes, zlib, base64
+import os, json, random, zlib, base64, io
 from urllib.parse import urlparse, urljoin
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, request, jsonify, redirect, abort, make_response, Response, send_file
+from flask import Flask, request, jsonify, redirect, abort, Response
+
+from PIL import Image
+import numpy as np
+import cv2
 
 app = Flask(__name__)
 
-# Config
+# -------- Defaults (can be overridden per-token) --------
 MAX_IMAGES = int(os.environ.get("MAX_IMAGES", "300"))
 TIMEOUT = int(os.environ.get("TIMEOUT", "10"))
-ALLOW_ANY_DOMAIN = os.environ.get("ALLOW_ANY_DOMAIN", "1") == "1"
 HEAD_CHECK_MAX = int(os.environ.get("HEAD_CHECK_MAX", "12"))
-USER_AGENT = os.environ.get("USER_AGENT", "Mozilla/5.0 (compatible; RandomImageBot/1.2)")
+USER_AGENT = os.environ.get("USER_AGENT", "Mozilla/5.0 (compatible; RandomImageBot/1.4)")
+
+DEFAULT_EXCLUDE_KEYWORDS = [s.strip().lower() for s in os.environ.get(
+    "EXCLUDE_KEYWORDS",
+    "logo, icon, sprite, favicon, avatar, badge, banner, placeholder, ads, advert, tracking, pixel, og:image"
+).split(",")]
+
+DEFAULT_MIN_WIDTH = int(os.environ.get("MIN_WIDTH", "320"))
+DEFAULT_MIN_HEIGHT = int(os.environ.get("MIN_HEIGHT", "320"))
+DEFAULT_MIN_BYTES = int(os.environ.get("MIN_BYTES", "15000"))
+DEFAULT_MAX_AR = float(os.environ.get("MAX_ASPECT_RATIO", "3.5"))
+DEFAULT_REQUIRE_PERSON = os.environ.get("REQUIRE_PERSON", "1") == "1"
+
 ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+
+# OpenCV HOG person detector
+_hog = cv2.HOGDescriptor()
+_hog.setSVMDetector(cv2.HOGDescriptor_getDefaultPeopleDetector())
 
 def no_cache(resp):
     resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
@@ -21,21 +40,25 @@ def no_cache(resp):
     resp.headers["Expires"] = "0"
     return resp
 
-# -------- Token encode/decode (deterministic share link) --------
-def url_to_token(u: str) -> str:
-    data = zlib.compress(u.encode("utf-8"))
-    b = base64.urlsafe_b64encode(data).decode("ascii")
-    return b.rstrip("=")
+# -------- Token encode/decode --------
+def to_token(payload: dict) -> str:
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    comp = zlib.compress(data)
+    b64 = base64.urlsafe_b64encode(comp).decode("ascii").rstrip("=")
+    return b64
 
-def token_to_url(token: str) -> str:
+def from_token(token: str) -> dict:
     pad = "=" * (-len(token) % 4)
-    data = base64.urlsafe_b64decode(token + pad)
-    return zlib.decompress(data).decode("utf-8")
+    comp = base64.urlsafe_b64decode(token + pad)
+    data = zlib.decompress(comp)
+    return json.loads(data.decode("utf-8"))
 
 def normalize_abs(page_url: str, candidate: str):
-    if not candidate: return None
+    if not candidate:
+        return None
     c = candidate.strip()
-    if not c or c.startswith("data:"): return None
+    if not c or c.startswith("data:"):
+        return None
     return urljoin(page_url, c)
 
 def is_ext_image_url(u: str) -> bool:
@@ -43,15 +66,50 @@ def is_ext_image_url(u: str) -> bool:
     _, ext = os.path.splitext(path)
     return ext and ext in ALLOWED_EXTS
 
-def head_is_image(u: str) -> bool:
+def head_is_image_and_big_enough(u: str, min_bytes: int) -> bool:
     try:
         r = requests.head(u, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT, allow_redirects=True)
-        ct = r.headers.get("Content-Type", "")
-        return ct.startswith("image/")
     except requests.RequestException:
         return False
+    ct = r.headers.get("Content-Type", "")
+    if "image" not in ct:
+        return False
+    try:
+        clen = int(r.headers.get("Content-Length", "0"))
+        if clen and clen < min_bytes:
+            return False
+    except ValueError:
+        pass
+    return True
 
-def scrape_images(page_url: str) -> list[str]:
+def fetch_image_bytes(u: str) -> bytes | None:
+    try:
+        r = requests.get(u, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT, allow_redirects=True, stream=True)
+        r.raise_for_status()
+        return r.content[:8*1024*1024]  # cap 8MB
+    except requests.RequestException:
+        return None
+
+def img_dims_ok(img: Image.Image, min_w: int, min_h: int, max_ar: float) -> bool:
+    w, h = img.size
+    if w < min_w or h < min_h:
+        return False
+    ar = max(w, h) / max(1.0, min(w, h))
+    if ar > max_ar:
+        return False
+    return True
+
+def has_person(img: Image.Image) -> bool:
+    arr = np.array(img.convert("RGB"))
+    bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    h, w = bgr.shape[:2]
+    scale = 640 / max(h, w) if max(h, w) > 640 else 1.0
+    if scale < 1.0:
+        bgr = cv2.resize(bgr, (int(w*scale), int(h*scale)))
+    rects, _ = _hog.detectMultiScale(bgr, winStride=(8,8), padding=(8,8), scale=1.05)
+    return len(rects) > 0
+
+def scrape_candidates(page_url: str) -> list[str]:
     headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
     r = requests.get(page_url, headers=headers, timeout=TIMEOUT, allow_redirects=True)
     r.raise_for_status()
@@ -60,7 +118,8 @@ def scrape_images(page_url: str) -> list[str]:
 
     def add(u):
         ab = normalize_abs(page_url, u)
-        if ab: found_abs.append(ab)
+        if ab:
+            found_abs.append(ab)
 
     for img in soup.find_all("img"):
         for attr in ("src", "data-src", "data-original", "data-lazy", "data-image"):
@@ -68,107 +127,245 @@ def scrape_images(page_url: str) -> list[str]:
         srcset = img.get("srcset")
         if srcset:
             parts = [p.strip().split(" ")[0] for p in srcset.split(",") if p.strip()]
-            for p in parts: add(p)
+            for p in parts:
+                add(p)
 
     for src in soup.find_all("source"):
         srcset = src.get("srcset")
         if srcset:
             parts = [p.strip().split(" ")[0] for p in srcset.split(",") if p.strip()]
-            for p in parts: add(p)
+            for p in parts:
+                add(p)
 
+    # dedupe
     seen = set(); uniq = []
     for u in found_abs:
         if u not in seen:
             uniq.append(u); seen.add(u)
+    return uniq[:MAX_IMAGES]
 
-    exts = [u for u in uniq if is_ext_image_url(u)]
-    if len(exts) < MAX_IMAGES and HEAD_CHECK_MAX > 0:
-        candidates = [u for u in uniq if not is_ext_image_url(u)]
-        for u in candidates[:HEAD_CHECK_MAX]:
-            if head_is_image(u):
-                exts.append(u)
-    return exts[:MAX_IMAGES]
+def excluded_by_keyword(u: str, keywords: list[str]) -> bool:
+    lu = u.lower()
+    for k in keywords:
+        k = k.strip().lower()
+        if not k: 
+            continue
+        if k in lu:
+            return True
+    # block obvious svg/ico
+    if lu.endswith(".svg") or lu.endswith(".ico"):
+        return True
+    return False
 
-# ---------------- Routes ----------------
-INLINE_UI = r"""<!doctype html>
+def pick_random_valid(cands: list[str], cfg: dict) -> str | None:
+    # Merge exclude list: default + user
+    merged_excl = DEFAULT_EXCLUDE_KEYWORDS[:]
+    user_excl = [s.strip().lower() for s in cfg.get("exclude", []) if s.strip()]
+    for s in user_excl:
+        if s not in merged_excl:
+            merged_excl.append(s)
+
+    min_w = int(cfg.get("min_w", DEFAULT_MIN_WIDTH))
+    min_h = int(cfg.get("min_h", DEFAULT_MIN_HEIGHT))
+    min_bytes = int(cfg.get("min_bytes", DEFAULT_MIN_BYTES))
+    max_ar = float(cfg.get("max_ar", DEFAULT_MAX_AR))
+    require_person = bool(cfg.get("require_person", DEFAULT_REQUIRE_PERSON))
+
+    random.shuffle(cands)
+    for u in cands:
+        if excluded_by_keyword(u, merged_excl):
+            continue
+        # HEAD check
+        if not head_is_image_and_big_enough(u, min_bytes=min_bytes):
+            continue
+        data = fetch_image_bytes(u)
+        if not data:
+            continue
+        try:
+            im = Image.open(io.BytesIO(data))
+            im.verify()
+            im = Image.open(io.BytesIO(data)).convert("RGB")
+        except Exception:
+            continue
+        if not img_dims_ok(im, min_w=min_w, min_h=min_h, max_ar=max_ar):
+            continue
+        if require_person and not has_person(im):
+            continue
+        return u
+    return None
+
+# -------- Routes --------
+ROOT_HTML = r"""<!doctype html>
 <html><head>
 <meta charset='utf-8'/>
 <meta name='viewport' content='width=device-width, initial-scale=1'/>
-<title>Random Image — Single Link</title>
+<title>Random Image — Single Link (AI + Keyword Filters)</title>
 <style>
- body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:24px}
- .card{border:1px solid #ddd;border-radius:12px;padding:16px;margin:16px 0}
- .row{display:flex;gap:8px;flex-wrap:wrap}
- input[type=url]{flex:1 1 520px;padding:10px;border-radius:8px;border:1px solid #ccc}
- button{padding:10px 14px;border-radius:8px;border:1px solid #aaa;cursor:pointer}
- .kvs{display:grid;grid-template-columns:170px 1fr;gap:8px}
- img{max-width:min(100%,800px);border-radius:10px;border:1px solid #ddd;margin-top:10px}
- .muted{color:#666;font-size:.9rem}
- code{background:#f5f5f5;padding:2px 6px;border-radius:6px}
-</style></head><body>
-<h2>Random Image — Single Link</h2>
-<div class='card'>
-  <div class='row'>
-    <input id='pageUrl' type='url' placeholder='Dán link trang chứa ảnh (https://...)'>
-    <button id='make'>Tạo link mặc định</button>
-    <button id='open'>Mở ảnh random</button>
+:root{
+  --bg:#0b0f19; --fg:#e6e8ef; --muted:#a0a7b4; --card:#111726; --border:#1c2437; --accent:#5b8cff; --ok:#2bd47d; --warn:#ffb020;
+}
+@media (prefers-color-scheme: light){
+  :root{ --bg:#f7f8fb; --fg:#0b1220; --muted:#5a6475; --card:#fff; --border:#e5e8ef; --accent:#3b6cff; --ok:#0aa05a; --warn:#b27700; }
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}
+.wrapper{max-width:960px;margin:0 auto;padding:24px}
+.header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.brand{font-weight:700;font-size:20px;letter-spacing:.2px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px;box-shadow:0 6px 24px rgba(0,0,0,.12);margin:16px 0}
+label{font-size:13px;color:var(--muted);display:block;margin-bottom:6px}
+input[type=url],input[type=text],textarea{width:100%;padding:12px 14px;border-radius:12px;border:1px solid var(--border);background:transparent;color:var(--fg);outline:none}
+textarea{min-height:72px;resize:vertical}
+.row{display:grid;grid-template-columns:1fr;gap:12px}
+@media(min-width:720px){ .row.two{grid-template-columns:1fr 1fr;} }
+.btn{display:inline-flex;gap:8px;align-items:center;padding:10px 14px;border-radius:12px;border:1px solid var(--border);background:linear-gradient(180deg,rgba(255,255,255,.04),rgba(255,255,255,.01));color:var(--fg);cursor:pointer}
+.btn:hover{transform:translateY(-1px)}
+.btn.primary{border-color:transparent;background:linear-gradient(180deg,var(--accent),#2f5fff);color:white}
+.actions{display:flex;gap:10px;flex-wrap:wrap}
+.kvs{display:grid;grid-template-columns:180px 1fr;gap:10px;align-items:center}
+a{color:var(--accent);text-decoration:none}
+.preview{margin-top:14px}
+img{max-width:min(100%,820px);border-radius:12px;border:1px solid var(--border)}
+.badge{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;border:1px solid var(--border);font-size:12px;color:var(--muted)}
+.switch{display:inline-flex;align-items:center;gap:8px;cursor:pointer}
+.switch input{display:none}
+.switch .slider{width:44px;height:26px;border-radius:26px;border:1px solid var(--border);background:#20293a;position:relative;transition:.2s}
+.switch input:checked + .slider{background:var(--accent)}
+.switch .knob{position:absolute;top:3px;left:3px;width:20px;height:20px;border-radius:20px;background:#fff;transition:.2s}
+.switch input:checked + .slider .knob{left:21px}
+.note{color:var(--muted);font-size:13px}
+.footer{display:flex;justify-content:flex-end;color:var(--muted);font-size:12px;margin-top:10px}
+</style>
+</head>
+<body>
+<div class="wrapper">
+  <div class="header">
+    <div class="brand">Random Image — Single Link</div>
+    <div class="badge">AI filter: person-only</div>
   </div>
-  <div class='muted'>Link sẽ có dạng <code>/r/&lt;token&gt;</code> — luôn là <b>1 link cố định</b> cho trang bạn nhập.</div>
-</div>
 
-<div class='card' id='result' style='display:none'>
-  <div class='kvs'>
-    <div>Shareable link:</div>
-    <div><a id='share' target='_blank' rel='noopener'></a> <button id='copyShare'>Copy</button></div>
-    <div>JSON link:</div>
-    <div><a id='jsonl' target='_blank' rel='noopener'></a> <button id='copyJson'>Copy</button></div>
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>Link trang chứa ảnh</label>
+        <input id="pageUrl" type="url" placeholder="https://...">
+      </div>
+    </div>
+    <div class="row two">
+      <div>
+        <label>Từ khoá loại trừ (phân tách bằng dấu phẩy)</label>
+        <textarea id="exclude" placeholder="ví dụ: logo, watermark, banner"></textarea>
+        <div class="note">Có sẵn bộ lọc mặc định: logo, icon, avatar, banner, favicon, ... (cộng thêm từ khoá bạn nhập)</div>
+      </div>
+      <div>
+        <label class="switch">
+          <input id="requirePerson" type="checkbox" checked>
+          <span class="slider"><span class="knob"></span></span>
+          <span>Chỉ lấy ảnh có người (AI)</span>
+        </label>
+        <div class="note">Dùng OpenCV HOG để phát hiện người; có thể bỏ sót/nhầm.</div>
+      </div>
+    </div>
+    <div class="actions">
+      <button class="btn primary" id="make">Tạo link mặc định</button>
+      <button class="btn" id="open">Mở ảnh ngẫu nhiên</button>
+      <button class="btn" id="save">Lưu cấu hình</button>
+    </div>
   </div>
-  <img id='preview' alt='Preview'/>
+
+  <div id="resultCard" class="card" style="display:none;">
+    <div class="kvs">
+      <div>Shareable link:</div>
+      <div><a id="share" target="_blank" rel="noopener"></a> <button class="btn" id="copyShare">Copy</button></div>
+      <div>JSON link:</div>
+      <div><a id="jsonl" target="_blank" rel="noopener"></a> <button class="btn" id="copyJson">Copy</button></div>
+    </div>
+    <div class="preview"><img id="preview" alt="Preview"></div>
+  </div>
+
+  <div class="footer">Hãy dùng với nội dung hợp pháp, tôn trọng bản quyền & robots.txt của trang nguồn.</div>
 </div>
 
 <script>
+function loadCfg(){
+  try{
+    const s = localStorage.getItem('ri_cfg');
+    if(!s) return;
+    const cfg=JSON.parse(s);
+    if(cfg.url) document.getElementById('pageUrl').value = cfg.url;
+    if(cfg.exclude) document.getElementById('exclude').value = cfg.exclude;
+    if(typeof cfg.requirePerson==='boolean') document.getElementById('requirePerson').checked = cfg.requirePerson;
+  }catch{}
+}
+function saveCfg(){
+  const cfg = {
+    url: document.getElementById('pageUrl').value.trim(),
+    exclude: document.getElementById('exclude').value.trim(),
+    requirePerson: document.getElementById('requirePerson').checked
+  };
+  localStorage.setItem('ri_cfg', JSON.stringify(cfg));
+}
 async function makeLink(){
-  const url=document.getElementById('pageUrl').value.trim();
-  if(!url){alert('Dán link trang vào trước đã.');return;}
-  const r=await fetch('/make?url='+encodeURIComponent(url));
-  if(!r.ok){const t=await r.text();throw new Error(t||('HTTP '+r.status));}
-  const d=await r.json();
-  document.getElementById('result').style.display='block';
+  const url = document.getElementById('pageUrl').value.trim();
+  if(!url){ alert('Dán link trang vào trước đã.'); return; }
+  const exclude = document.getElementById('exclude').value.trim();
+  const rp = document.getElementById('requirePerson').checked ? 1 : 0;
+  const r = await fetch(`/make?url=${encodeURIComponent(url)}&exclude=${encodeURIComponent(exclude)}&require_person=${rp}`);
+  if(!r.ok){ const t = await r.text(); throw new Error(t || ('HTTP '+r.status)); }
+  const d = await r.json();
+  document.getElementById('resultCard').style.display='block';
   const s=document.getElementById('share'); s.href=d.shareable_random_link; s.textContent=d.shareable_random_link;
   const j=document.getElementById('jsonl'); j.href=d.json_link; j.textContent=d.json_link;
   const r2=await fetch(d.json_link); if(r2.ok){ const d2=await r2.json(); document.getElementById('preview').src=d2.random_image_url; }
 }
 document.getElementById('make').addEventListener('click', async ()=>{
   const btn=document.getElementById('make'); btn.disabled=true; btn.textContent='Đang xử lý...';
-  try{ await makeLink(); } catch(e){ alert('Lỗi: '+e.message); }
+  try{ await makeLink(); saveCfg(); } catch(e){ alert('Lỗi: '+e.message); }
   finally{ btn.disabled=false; btn.textContent='Tạo link mặc định'; }
 });
-document.getElementById('open').addEventListener('click', ()=>{
-  const url=document.getElementById('pageUrl').value.trim();
-  if(!url){alert('Dán link trang vào trước đã.');return;}
-  makeLink().then(()=>{ window.open(document.getElementById('share').href,'_blank'); });
+document.getElementById('open').addEventListener('click', async ()=>{
+  try{
+    await makeLink();
+    window.open(document.getElementById('share').href,'_blank');
+  }catch(e){ alert('Lỗi: '+e.message); }
 });
-document.getElementById('copyShare').addEventListener('click',()=>{navigator.clipboard.writeText(document.getElementById('share').href).catch(()=>{});});
-document.getElementById('copyJson').addEventListener('click',()=>{navigator.clipboard.writeText(document.getElementById('jsonl').href).catch(()=>{});});
+document.getElementById('save').addEventListener('click', ()=>{ saveCfg(); alert('Đã lưu'); });
+document.getElementById('exclude').addEventListener('keydown', (e)=>{ if(e.key==='Enter' && (e.ctrlKey||e.metaKey)){ document.getElementById('make').click(); }});
+loadCfg();
 </script>
 </body></html>
 """
 
+# ---- Core logic helpers (server-side) ----
+def parse_exclude(s: str) -> list[str]:
+    if not s:
+        return []
+    parts = [p.strip() for p in s.split(",")]
+    return [p for p in parts if p]
+
+def build_payload(page_url: str, exclude_kw: str, require_person_flag: str) -> dict:
+    payload = {"url": page_url}
+    ex = parse_exclude(exclude_kw)
+    if ex: payload["exclude"] = ex
+    rp = 1 if (require_person_flag or "1") in ("1", "true", "True", "on") else 0
+    payload["require_person"] = bool(rp)
+    return payload
+
 @app.get("/")
 def root_ui():
-    # If a static index exists, serve it; else inline UI.
-    static_index = os.path.join(os.getcwd(), "static", "index.html")
-    if os.path.isfile(static_index):
-        return send_file(static_index)
-    return Response(INLINE_UI, mimetype="text/html")
+    return Response(ROOT_HTML, mimetype="text/html")
 
 @app.get("/make")
 def make_link():
     page_url = request.args.get("url", "").strip()
-    if not page_url: abort(400, description="Missing ?url=")
+    if not page_url:
+        abort(400, description="Missing ?url=")
     if not page_url.startswith(("http://", "https://")):
         abort(400, description="url must start with http(s)://")
-    token = url_to_token(page_url)
+    exclude_kw = request.args.get("exclude", "").strip()
+    require_person_flag = request.args.get("require_person", "1").strip()
+    payload = build_payload(page_url, exclude_kw, require_person_flag)
+    token = to_token(payload)
     base = request.url_root.rstrip("/")
     return jsonify({
         "source_url": page_url,
@@ -177,40 +374,173 @@ def make_link():
         "json_link": f"{base}/j/{token}"
     })
 
+def scrape_candidates(page_url: str) -> list[str]:
+    headers = {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
+    r = requests.get(page_url, headers=headers, timeout=TIMEOUT, allow_redirects=True)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    found_abs = []
+    def add(u):
+        ab = normalize_abs(page_url, u)
+        if ab: found_abs.append(ab)
+    for img in soup.find_all("img"):
+        for attr in ("src","data-src","data-original","data-lazy","data-image"):
+            add(img.get(attr))
+        srcset = img.get("srcset")
+        if srcset:
+            parts = [p.strip().split(" ")[0] for p in srcset.split(",") if p.strip()]
+            for p in parts: add(p)
+    for src in soup.find_all("source"):
+        srcset = src.get("srcset")
+        if srcset:
+            parts = [p.strip().split(" ")[0] for p in srcset.split(",") if p.strip()]
+            for p in parts: add(p)
+    seen=set(); uniq=[]
+    for u in found_abs:
+        if u not in seen:
+            uniq.append(u); seen.add(u)
+    return uniq[:MAX_IMAGES]
+
+def normalize_abs(page_url: str, candidate: str):
+    if not candidate: return None
+    c = candidate.strip()
+    if not c or c.startswith("data:"): return None
+    return urljoin(page_url, c)
+
+def excluded_by_keyword(u: str, keywords: list[str]) -> bool:
+    lu = u.lower()
+    for k in keywords:
+        if k and k in lu:
+            return True
+    if lu.endswith(".svg") or lu.endswith(".ico"):
+        return True
+    return False
+
+def head_is_image_and_big_enough(u: str, min_bytes: int) -> bool:
+    try:
+        r = requests.head(u, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT, allow_redirects=True)
+    except requests.RequestException:
+        return False
+    ct = r.headers.get("Content-Type", "")
+    if "image" not in ct:
+        return False
+    try:
+        clen = int(r.headers.get("Content-Length", "0"))
+        if clen and clen < min_bytes:
+            return False
+    except ValueError:
+        pass
+    return True
+
+def fetch_image_bytes(u: str) -> bytes | None:
+    try:
+        r = requests.get(u, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT, allow_redirects=True, stream=True)
+        r.raise_for_status()
+        return r.content[:8*1024*1024]
+    except requests.RequestException:
+        return None
+
+def img_dims_ok(img: Image.Image, min_w: int, min_h: int, max_ar: float) -> bool:
+    w, h = img.size
+    if w < min_w or h < min_h:
+        return False
+    ar = max(w, h) / max(1.0, min(w, h))
+    if ar > max_ar:
+        return False
+    return True
+
+def has_person(img: Image.Image) -> bool:
+    arr = np.array(img.convert("RGB"))
+    bgr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+    h, w = bgr.shape[:2]
+    scale = 640 / max(h, w) if max(h, w) > 640 else 1.0
+    if scale < 1.0:
+        bgr = cv2.resize(bgr, (int(w*scale), int(h*scale)))
+    rects, _ = cv2.HOGDescriptor_getDefaultPeopleDetector(), None
+    # Using the global _hog detector defined above for consistency
+    rects, _ = _hog.detectMultiScale(bgr, winStride=(8,8), padding=(8,8), scale=1.05)
+    return len(rects) > 0
+
+def pick_random_valid(cands: list[str], cfg: dict) -> str | None:
+    merged_excl = DEFAULT_EXCLUDE_KEYWORDS[:]
+    user_excl = [s.strip().lower() for s in cfg.get("exclude", []) if s.strip()]
+    for s in user_excl:
+        if s not in merged_excl:
+            merged_excl.append(s)
+    min_w = int(cfg.get("min_w", DEFAULT_MIN_WIDTH))
+    min_h = int(cfg.get("min_h", DEFAULT_MIN_HEIGHT))
+    min_bytes = int(cfg.get("min_bytes", DEFAULT_MIN_BYTES))
+    max_ar = float(cfg.get("max_ar", DEFAULT_MAX_AR))
+    require_person = bool(cfg.get("require_person", DEFAULT_REQUIRE_PERSON))
+
+    random.shuffle(cands)
+    for u in cands:
+        if excluded_by_keyword(u, merged_excl):
+            continue
+        if not head_is_image_and_big_enough(u, min_bytes=min_bytes):
+            continue
+        data = fetch_image_bytes(u)
+        if not data:
+            continue
+        try:
+            im = Image.open(io.BytesIO(data))
+            im.verify()
+            im = Image.open(io.BytesIO(data)).convert("RGB")
+        except Exception:
+            continue
+        if not img_dims_ok(im, min_w=min_w, min_h=min_h, max_ar=max_ar):
+            continue
+        if require_person and not has_person(im):
+            continue
+        return u
+    return None
+
 @app.get("/r/<token>")
 def open_random(token):
     try:
-        page_url = token_to_url(token)
+        payload = from_token(token)
     except Exception:
         abort(400, description="Bad token")
+    page_url = payload.get("url", "")
+    if not page_url:
+        abort(400, description="Token missing url")
     try:
-        images = scrape_images(page_url)
+        cands = scrape_candidates(page_url)
     except requests.RequestException as e:
         abort(502, description=f"Failed to fetch page: {e}")
-    if not images:
-        abort(404, description="No images found on that page")
-    url = random.choice(images)
+    url = pick_random_valid(cands, cfg=payload)
+    if not url:
+        abort(404, description="No suitable image found after filtering")
     return no_cache(redirect(url, code=302))
 
 @app.get("/j/<token>")
 def json_random(token):
     try:
-        page_url = token_to_url(token)
+        payload = from_token(token)
     except Exception:
         abort(400, description="Bad token")
+    page_url = payload.get("url", "")
+    if not page_url:
+        abort(400, description="Token missing url")
     try:
-        images = scrape_images(page_url)
+        cands = scrape_candidates(page_url)
     except requests.RequestException as e:
         abort(502, description=f"Failed to fetch page: {e}")
-    if not images:
-        abort(404, description="No images found on that page")
-    url = random.choice(images)
+    url = pick_random_valid(cands, cfg=payload)
+    if not url:
+        abort(404, description="No suitable image found after filtering")
     base = request.url_root.rstrip("/")
     return no_cache(jsonify({
         "source_url": page_url,
+        "filters": {k:payload.get(k) for k in ("exclude","require_person") if k in payload},
         "random_image_url": url,
         "shareable_random_link": f"{base}/r/{token}"
     }))
+
+# Small helper for HEADless hosting health checks
+@app.get("/health")
+def health():
+    return "ok"
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
