@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: page-scrape-random-image-one-shot-ui-v2
+    name: randomanhnongbong
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
