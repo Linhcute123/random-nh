@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: page-scrape-random-image-one-shot-ui-v2
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --preload --workers=1 --threads=4 --timeout=90
+    autoDeploy: true
+    envVars:
+      - key: ALLOW_ANY_DOMAIN
+        value: 1
+      - key: MAX_IMAGES
+        value: 300
+      - key: TIMEOUT
+        value: 10
+      - key: HEAD_CHECK_MAX
+        value: 12
